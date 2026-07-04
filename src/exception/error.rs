@@ -5,7 +5,6 @@ pub enum BotError {
     Config(String),
     Wasm(String),
     Discord(String),
-    Database(String),
     Other(String),
 }
 
@@ -15,7 +14,6 @@ impl fmt::Display for BotError {
             Self::Config(msg) => write!(f, "Config error: {msg}"),
             Self::Wasm(msg) => write!(f, "Wasm error: {msg}"),
             Self::Discord(msg) => write!(f, "Discord error: {msg}"),
-            Self::Database(msg) => write!(f, "Database error: {msg}"),
             Self::Other(msg) => write!(f, "{msg}"),
         }
     }
