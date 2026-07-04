@@ -17,14 +17,13 @@ pub fn create_http_client() -> Result<HttpClient> {
 pub async fn connect(
     http: SharedHttp,
     manager: crate::wasm::loader::PluginManager,
-    db: Option<crate::database::Database>,
 ) -> Result<(Shard, tokio::task::JoinHandle<Result<()>>)> {
     let token = std::env::var("DISCORD_TOKEN")?;
     let intents = Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
 
     let shard = Shard::new(ShardId::ONE, token, intents);
     let handle = tokio::spawn(async move {
-        bot_loop(shard, http, manager, db).await
+        bot_loop(shard, http, manager).await
     });
 
     let placeholder = Shard::new(ShardId::ONE, String::new(), Intents::empty());
@@ -35,7 +34,6 @@ async fn bot_loop(
     mut shard: Shard,
     http: SharedHttp,
     manager: crate::wasm::loader::PluginManager,
-    _db: Option<crate::database::Database>,
 ) -> Result<()> {
     tracing::info!("Connecting to Discord gateway...");
 

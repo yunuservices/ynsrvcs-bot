@@ -5,8 +5,6 @@ pub struct Config {
     pub discord_token: String,
     pub plugin_dir: PathBuf,
     pub log_level: String,
-    pub database_url: Option<String>,
-    pub cache_size: usize,
     pub gateway_intents: Vec<String>,
 }
 
@@ -19,10 +17,6 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from("plugins")),
             log_level: env_opt("LOG_LEVEL")
                 .unwrap_or_else(|| "ynsrvcs=info".into()),
-            database_url: env_opt("DATABASE_URL"),
-            cache_size: env_opt("CACHE_SIZE")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(256),
             gateway_intents: env_opt("GATEWAY_INTENTS")
                 .map(|v| v.split(',').map(String::from).collect())
                 .unwrap_or_else(|| vec!["GUILD_MESSAGES".into(), "MESSAGE_CONTENT".into()]),

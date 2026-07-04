@@ -1,6 +1,5 @@
 pub mod bot;
 pub mod config;
-pub mod database;
 pub mod exception;
 pub mod utils;
 pub mod wasm;
@@ -10,7 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub async fn run() -> Result<()> {
-    let cfg = config::Config::from_env();
+    let _cfg = config::Config::from_env();
     utils::helpers::init_logging()?;
 
     let engine = wasm::plugin::create_engine()?;
@@ -20,13 +19,7 @@ pub async fn run() -> Result<()> {
 
     tokio::spawn(wasm::hotreload::watch(plugin_manager.clone()));
 
-    let db = if let Some(url) = &cfg.database_url {
-        Some(database::Database::connect(url).await?)
-    } else {
-        None
-    };
-
-    let (_shard, tasks) = bot::handler::connect(http_client, plugin_manager, db).await?;
+    let (_shard, tasks) = bot::handler::connect(http_client, plugin_manager).await?;
 
     tasks.await??;
     Ok(())
