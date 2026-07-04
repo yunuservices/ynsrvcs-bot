@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 use wasmtime::component::Component;
@@ -14,9 +14,13 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView, WasiCtxView};
 
 use super::plugin;
 
+const PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct HostContext {
     wasi: WasiCtx,
     table: ResourceTable,
+    client: reqwest::Client,
     gateway_ping_ms: Arc<AtomicU64>,
     kv: Arc<Mutex<HashMap<(String, String), Vec<u8>>>>,
 }
@@ -29,6 +33,7 @@ impl HostContext {
         Self {
             wasi: WasiCtxBuilder::new().build(),
             table: ResourceTable::default(),
+            client: reqwest::Client::new(),
             gateway_ping_ms,
             kv,
         }
@@ -49,42 +54,53 @@ impl WasiView for HostContext {
 }
 
 impl plugin::ynsrvcs::plugins::host::Host for HostContext {
-    fn http_request(
+    async fn http_request(
         &mut self,
         method: String,
         url: String,
         body: Vec<u8>,
     ) -> Result<plugin::ynsrvcs::plugins::host::Response, String> {
-        tokio::task::block_in_place(|| {
-            let agent = ureq::agent();
-            let http_req = http::Request::builder()
-                .method(method.as_str())
-                .uri(url.as_str())
-                .body(body)
-                .map_err(|e| e.to_string())?;
-            let resp = agent.run(http_req).map_err(|e| e.to_string())?;
-            let status: u16 = resp.status().into();
-            let body = resp.into_body().read_to_vec().map_err(|e| e.to_string())?;
-            Ok(plugin::ynsrvcs::plugins::host::Response { status, body })
-        })
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|e| e.to_string())?;
+
+        let req = self
+            .client
+            .request(method, &url)
+            .body(body)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let resp = tokio::time::timeout(HTTP_TIMEOUT, self.client.execute(req))
+            .await
+            .map_err(|_| "http request timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+
+        let status = resp.status().as_u16();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| e.to_string())?
+            .to_vec();
+
+        Ok(plugin::ynsrvcs::plugins::host::Response { status, body })
     }
 
-    fn get_env(&mut self, name: String) -> Option<String> {
+    async fn get_env(&mut self, name: String) -> Option<String> {
         std::env::var(&name).ok().filter(|v| !v.is_empty())
     }
 
-    fn gateway_ping(&mut self) -> u64 {
+    async fn gateway_ping(&mut self) -> u64 {
         self.gateway_ping_ms.load(Ordering::Relaxed)
     }
 
-    fn now_ms(&mut self) -> u64 {
+    async fn now_ms(&mut self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
     }
 
-    fn log(&mut self, level: String, message: String) {
+    async fn log(&mut self, level: String, message: String) {
         match level.to_lowercase().as_str() {
             "error" => tracing::error!("{message}"),
             "warn" => tracing::warn!("{message}"),
@@ -95,22 +111,24 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
         }
     }
 
-    fn kv_get(&mut self, scope: String, key: String) -> Option<Vec<u8>> {
+    async fn kv_get(&mut self, scope: String, key: String) -> Option<Vec<u8>> {
         self.kv.lock().ok()?.get(&(scope, key)).cloned()
     }
 
-    fn kv_set(&mut self, scope: String, key: String, value: Vec<u8>) {
+    async fn kv_set(&mut self, scope: String, key: String, value: Vec<u8>) {
         if let Ok(mut kv) = self.kv.lock() {
             kv.insert((scope, key), value);
         }
     }
 
-    fn fs_read(&mut self, path: String) -> Result<Vec<u8>, String> {
-        tokio::task::block_in_place(|| std::fs::read(&path).map_err(|e| e.to_string()))
+    async fn fs_read(&mut self, path: String) -> Result<Vec<u8>, String> {
+        tokio::fs::read(&path).await.map_err(|e| e.to_string())
     }
 
-    fn fs_write(&mut self, path: String, content: Vec<u8>) -> Result<(), String> {
-        tokio::task::block_in_place(|| std::fs::write(&path, &content).map_err(|e| e.to_string()))
+    async fn fs_write(&mut self, path: String, content: Vec<u8>) -> Result<(), String> {
+        tokio::fs::write(&path, &content)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -209,7 +227,7 @@ impl PluginManager {
         let component = Component::new(engine, &bytes)?;
         let mut linker = wasmtime::component::Linker::new(engine);
 
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
         plugin::PluginWorld::add_to_linker::<HostContext, HostContext>(
             &mut linker,
@@ -268,14 +286,18 @@ impl PluginManager {
         let mut plugins = self.plugins.lock().await;
         for (_name, loaded) in plugins.iter_mut() {
             let guest = loaded.world.ynsrvcs_plugins_plugin();
-            if let Err(e) = guest.call_handle_event(
+            let fut = guest.call_handle_event(
                 &mut loaded.store,
                 event_type,
                 &payload,
                 guild_id,
                 channel_id,
-            ) {
-                tracing::error!("Plugin {_name} error handling {event_type}: {e}");
+            );
+
+            match tokio::time::timeout(PLUGIN_CALL_TIMEOUT, fut).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!("Plugin {_name} error handling {event_type}: {e}"),
+                Err(_) => tracing::error!("Plugin {_name} timed out handling {event_type}"),
             }
         }
     }
@@ -352,7 +374,7 @@ mod tests {
             b"hello",
             0,
             0,
-        )?;
+        ).await?;
 
         Ok(())
     }

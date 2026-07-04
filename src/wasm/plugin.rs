@@ -13,4 +13,6 @@ pub fn create_engine() -> anyhow::Result<Engine> {
 wasmtime::component::bindgen!({
     path: "src/wasm/wit",
     world: "plugin-world",
+    imports: { default: async },
+    exports: { default: async },
 });
