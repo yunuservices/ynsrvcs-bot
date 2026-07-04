@@ -1,36 +1,49 @@
 use anyhow::Result;
 use tokio_stream::StreamExt;
-use twilight_gateway::{Intents, Message, Shard};
+use twilight_gateway::{CloseFrame, Intents, Message, Shard};
 use twilight_model::gateway::ShardId;
 
 pub async fn connect(
     manager: crate::wasm::loader::PluginManager,
-) -> Result<(Shard, tokio::task::JoinHandle<Result<()>>)> {
+) -> Result<(
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<()>>,
+)> {
     let token = std::env::var("DISCORD_TOKEN")?;
     let intents = Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
 
     let shard = Shard::new(ShardId::ONE, token, intents);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        bot_loop(shard, manager).await
+        bot_loop(shard, manager, shutdown_rx).await
     });
 
-    let placeholder = Shard::new(ShardId::ONE, String::new(), Intents::empty());
-    Ok((placeholder, handle))
+    Ok((shutdown_tx, handle))
 }
 
 async fn bot_loop(
     mut shard: Shard,
     manager: crate::wasm::loader::PluginManager,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
     tracing::info!("Connecting to Discord gateway...");
 
-    while let Some(item) = shard.next().await {
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = &mut shutdown_rx => {
+                let _ = shard.close(CloseFrame::NORMAL);
+                return Ok(());
+            }
+            item = shard.next() => item,
+        };
         let msg = match item {
-            Ok(m) => m,
-            Err(e) => {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
                 tracing::warn!(?e, "Gateway receive error");
                 continue;
             }
+            None => break,
         };
 
         let text = match msg {

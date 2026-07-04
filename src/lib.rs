@@ -14,10 +14,33 @@ pub async fn run() -> Result<()> {
     let plugin_manager = wasm::loader::PluginManager::new(&engine)?;
     plugin_manager.load_all().await?;
 
-    tokio::spawn(wasm::hotreload::watch(plugin_manager.clone()));
+    let watch_handle = tokio::spawn(wasm::hotreload::watch(plugin_manager.clone()));
 
-    let (_shard, tasks) = bot::handler::connect(plugin_manager).await?;
+    let (shutdown_tx, mut tasks) = bot::handler::connect(plugin_manager.clone()).await?;
 
-    tasks.await??;
+    let mut shutdown = false;
+    tokio::select! {
+        res = &mut tasks => {
+            res??;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutdown signal received, closing gateway connection...");
+            drop(shutdown_tx);
+            shutdown = true;
+        }
+    }
+
+    if shutdown {
+        if let Err(e) = tasks.await {
+            tracing::error!(?e, "Bot loop terminated unexpectedly");
+        }
+    }
+
+    watch_handle.abort();
+    let _ = watch_handle.await;
+
+    plugin_manager.unload_all().await;
+    tracing::info!("Shutdown complete");
+
     Ok(())
 }

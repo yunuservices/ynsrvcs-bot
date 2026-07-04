@@ -263,6 +263,15 @@ impl PluginManager {
         info!("Plugin unloaded: {name}");
     }
 
+    pub async fn unload_all(&self) {
+        let plugins = self.plugins.lock().await;
+        let names: Vec<String> = plugins.keys().cloned().collect();
+        drop(plugins);
+        for name in names {
+            self.unload(&name).await;
+        }
+    }
+
     pub async fn unload_by_path(&self, wasm_path: &Path) {
         let name = Self::plugin_name(wasm_path);
         self.unload(&name).await;
