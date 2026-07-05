@@ -6,9 +6,8 @@ use notify::{RecursiveMode, Watcher};
 
 pub async fn watch(manager: PluginManager) {
     let dir = plugin_dir();
-    let path = Path::new(&dir);
-    if !path.exists() {
-        info!("Plugin directory does not exist, hot-reload disabled: {dir}");
+    if !dir.exists() {
+        info!("Plugin directory does not exist, hot-reload disabled: {}", dir.display());
         return;
     }
 
@@ -30,12 +29,12 @@ pub async fn watch(manager: PluginManager) {
             }
         };
 
-    if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
+    if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
         tracing::error!(?e, "Failed to watch plugin directory");
         return;
     }
 
-    info!("Watching plugin directory: {dir}");
+    info!("Watching plugin directory: {}", dir.display());
 
     while let Some(p) = rx.recv().await {
         handle_file_event(&manager, &p).await;

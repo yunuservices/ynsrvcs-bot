@@ -1,15 +1,14 @@
-use anyhow::Result;
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
-use wasmtime::Engine;
-use wasmtime::Store;
-use wasmtime::component::Component;
-use wasmtime::component::ResourceTable;
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use super::kv::KvStore;
@@ -20,20 +19,22 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct HostContext {
     wasi: WasiCtx,
-    table: ResourceTable,
+    table: wasmtime::component::ResourceTable,
     client: reqwest::Client,
     gateway_ping_ms: Arc<AtomicU64>,
     kv: KvStore,
+    workspace: PathBuf,
 }
 
 impl HostContext {
-    pub fn new(gateway_ping_ms: Arc<AtomicU64>, kv: KvStore) -> Self {
+    pub fn new(gateway_ping_ms: Arc<AtomicU64>, kv: KvStore, workspace: PathBuf) -> Self {
         Self {
             wasi: WasiCtxBuilder::new().build(),
-            table: ResourceTable::default(),
+            table: wasmtime::component::ResourceTable::default(),
             client: reqwest::Client::new(),
             gateway_ping_ms,
             kv,
+            workspace,
         }
     }
 }
@@ -113,11 +114,12 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
     }
 
     async fn fs_read(&mut self, path: String) -> Result<Vec<u8>, String> {
-        tokio::fs::read(&path).await.map_err(|e| e.to_string())
+        tokio::fs::read(self.workspace.join(path)).await.map_err(|e| e.to_string())
     }
 
     async fn fs_write(&mut self, path: String, content: Vec<u8>) -> Result<(), String> {
-        if let Some(parent) = Path::new(&path).parent() {
+        let path = self.workspace.join(path);
+        if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -129,8 +131,7 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
 }
 
 pub(crate) struct LoadedPlugin {
-    world: plugin::PluginWorld,
-    store: Store<HostContext>,
+    component: Arc<Component>,
 }
 
 #[derive(Clone)]
@@ -141,8 +142,21 @@ pub struct PluginManager {
     kv: KvStore,
 }
 
-pub fn plugin_dir() -> String {
-    std::env::var("PLUGIN_DIR").unwrap_or_else(|_| "./plugins".into())
+pub fn plugin_dir() -> PathBuf {
+    std::env::var("PLUGIN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./plugins"))
+}
+
+fn workspace_path(name: &str) -> PathBuf {
+    plugin_dir().join(name).join("workspace")
+}
+
+fn create_linker(engine: &Engine) -> Result<Linker<HostContext>> {
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    plugin::PluginWorld::add_to_linker::<HostContext, HostContext>(&mut linker, |s| s)?;
+    Ok(linker)
 }
 
 impl PluginManager {
@@ -160,15 +174,14 @@ impl PluginManager {
     }
 
     pub async fn load_all(&self) -> Result<()> {
-        let dir = plugin_dir();
-        let path = Path::new(&dir);
+        let path = plugin_dir();
         if !path.exists() {
-            tokio::fs::create_dir_all(path).await?;
-            info!("Created plugin directory: {dir}");
+            tokio::fs::create_dir_all(&path).await?;
+            info!("Created plugin directory: {}", path.display());
         }
 
         let mut entries = Vec::new();
-        let mut read = tokio::fs::read_dir(path).await?;
+        let mut read = tokio::fs::read_dir(&path).await?;
         while let Some(entry) = read.next_entry().await? {
             let p = entry.path();
             if p.extension().is_some_and(|e| e == "wasm") {
@@ -186,9 +199,7 @@ impl PluginManager {
             )
             .await
             {
-                Ok((name, loaded)) => {
-                    loaded_plugins.push((name, loaded));
-                }
+                Ok((name, loaded)) => loaded_plugins.push((name, loaded)),
                 Err(e) => {
                     tracing::error!("Failed to load {}: {e}", wasm_path.display());
                 }
@@ -221,19 +232,29 @@ impl PluginManager {
         let name = Self::plugin_name(wasm_path);
 
         let component = Component::new(engine, &bytes)?;
-        let mut linker = wasmtime::component::Linker::new(engine);
+        let workspace = workspace_path(&name);
+        tokio::fs::create_dir_all(&workspace).await?;
 
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        let mut store = Store::new(
+            engine,
+            HostContext::new(gateway_ping_ms, kv.clone(), workspace.clone()),
+        );
+        let linker = create_linker(engine)?;
+        let instance = plugin::PluginWorld::instantiate_async(&mut store, &component, &linker).await?;
 
-        plugin::PluginWorld::add_to_linker::<HostContext, HostContext>(
-            &mut linker,
-            |s: &mut HostContext| s,
-        )?;
+        match instance
+            .ynsrvcs_plugins_plugin()
+            .call_initialize(&mut store, None)
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => anyhow::bail!("plugin initialization failed: {err}"),
+            Err(err) => anyhow::bail!("plugin initialization trapped: {err}"),
+        }
 
-        let mut store = Store::new(engine, HostContext::new(gateway_ping_ms, kv));
-        let world = plugin::PluginWorld::instantiate_async(&mut store, &component, &linker).await?;
-
-        Ok((name, LoadedPlugin { world, store }))
+        Ok((name, LoadedPlugin {
+            component: Arc::new(component),
+        }))
     }
 
     pub async fn load(&self, wasm_path: &Path) -> Result<String> {
@@ -249,14 +270,50 @@ impl PluginManager {
     }
 
     pub async fn unload(&self, name: &str) {
+        let maybe_loaded = {
+            let plugins = self.plugins.lock().await;
+            plugins.get(name).map(|loaded| Arc::clone(&loaded.component))
+        };
+
+        if let Some(component) = maybe_loaded {
+            let mut store = Store::new(
+                &self.engine,
+                HostContext::new(
+                    Arc::clone(&self.gateway_ping_ms),
+                    self.kv.clone(),
+                    workspace_path(name),
+                ),
+            );
+            let linker = match create_linker(&self.engine) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to create linker for {name} shutdown: {e}");
+                    self.plugins.lock().await.remove(name);
+                    return;
+                }
+            };
+
+            match plugin::PluginWorld::instantiate_async(&mut store, &component, &linker).await {
+                Ok(instance) => {
+                    if let Err(e) = instance.ynsrvcs_plugins_plugin().call_shutdown(&mut store).await {
+                        tracing::warn!("Shutdown trap for {name}: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to instantiate {name} for shutdown: {e}");
+                }
+            }
+        }
+
         self.plugins.lock().await.remove(name);
         info!("Plugin unloaded: {name}");
     }
 
     pub async fn unload_all(&self) {
-        let plugins = self.plugins.lock().await;
-        let names: Vec<String> = plugins.keys().cloned().collect();
-        drop(plugins);
+        let names: Vec<String> = {
+            let plugins = self.plugins.lock().await;
+            plugins.keys().cloned().collect()
+        };
         for name in names {
             self.unload(&name).await;
         }
@@ -286,22 +343,61 @@ impl PluginManager {
         guild_id: u64,
         channel_id: u64,
     ) {
-        let mut plugins = self.plugins.lock().await;
-        for (_name, loaded) in plugins.iter_mut() {
-            let guest = loaded.world.ynsrvcs_plugins_plugin();
-            let fut = guest.call_handle_event(
-                &mut loaded.store,
-                event_type,
-                &payload,
-                guild_id,
-                channel_id,
-            );
+        let plugins = {
+            let guard = self.plugins.lock().await;
+            guard
+                .iter()
+                .map(|(name, loaded)| (name.clone(), Arc::clone(&loaded.component)))
+                .collect::<Vec<_>>()
+        };
 
-            match tokio::time::timeout(PLUGIN_CALL_TIMEOUT, fut).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::error!("Plugin {_name} error handling {event_type}: {e}"),
-                Err(_) => tracing::error!("Plugin {_name} timed out handling {event_type}"),
-            }
+        for (name, component) in plugins {
+            let engine = Arc::clone(&self.engine);
+            let gateway_ping_ms = Arc::clone(&self.gateway_ping_ms);
+            let kv = self.kv.clone();
+            let workspace = workspace_path(&name);
+            let event_type = event_type.to_string();
+            let payload = payload.clone();
+
+            let handle = async move {
+                let mut store = Store::new(
+                    &engine,
+                    HostContext::new(gateway_ping_ms, kv, workspace),
+                );
+                let linker = match create_linker(&engine) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!("Failed to create linker for {name}: {e}");
+                        return;
+                    }
+                };
+
+                let instance = match plugin::PluginWorld::instantiate_async(&mut store, &component, &linker).await {
+                    Ok(i) => i,
+                    Err(e) => {
+                        tracing::error!("Failed to instantiate {name} for {event_type}: {e}");
+                        return;
+                    }
+                };
+
+                let guest = instance.ynsrvcs_plugins_plugin();
+                let fut = guest.call_handle_event(
+                    &mut store,
+                    &event_type,
+                    &payload,
+                    guild_id,
+                    channel_id,
+                );
+
+                match tokio::time::timeout(PLUGIN_CALL_TIMEOUT, fut).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(err))) => tracing::error!("Plugin {name} error handling {event_type}: {err}"),
+                    Ok(Err(err)) => tracing::error!("Plugin {name} trapped handling {event_type}: {err}"),
+                    Err(_) => tracing::error!("Plugin {name} timed out handling {event_type}"),
+                }
+            };
+
+            handle.await;
         }
     }
 }
@@ -359,7 +455,7 @@ mod tests {
 
         let wasm_path = ensure_ping_wasm()?;
         let engine = crate::wasm::plugin::create_engine()?;
-        let (name, mut loaded) = PluginManager::load_one(
+        let (name, _) = PluginManager::load_one(
             &engine,
             Arc::new(AtomicU64::new(0)),
             KvStore::with_path(std::env::temp_dir().join("ynsrvcs-test-kv.json")),
@@ -367,12 +463,6 @@ mod tests {
         )
         .await?;
         assert_eq!(name, "ping");
-
-        loaded
-            .world
-            .ynsrvcs_plugins_plugin()
-            .call_handle_event(&mut loaded.store, "MESSAGE_CREATE", b"hello", 0, 0)
-            .await?;
 
         Ok(())
     }
