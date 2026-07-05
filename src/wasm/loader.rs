@@ -355,6 +355,7 @@ impl PluginManager {
             let engine = Arc::clone(&self.engine);
             let gateway_ping_ms = Arc::clone(&self.gateway_ping_ms);
             let kv = self.kv.clone();
+            let kv_for_save = kv.clone();
             let workspace = workspace_path(&name);
             let event_type = event_type.to_string();
             let payload = payload.clone();
@@ -394,6 +395,10 @@ impl PluginManager {
                     Ok(Ok(Err(err))) => tracing::error!("Plugin {name} error handling {event_type}: {err}"),
                     Ok(Err(err)) => tracing::error!("Plugin {name} trapped handling {event_type}: {err}"),
                     Err(_) => tracing::error!("Plugin {name} timed out handling {event_type}"),
+                }
+
+                if let Err(err) = kv_for_save.save() {
+                    tracing::error!("Failed to persist KV after {event_type} for {name}: {err}");
                 }
             };
 
