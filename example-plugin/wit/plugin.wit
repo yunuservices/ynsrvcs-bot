@@ -20,7 +20,9 @@ interface host {
 }
 
 interface plugin {
-    handle-event: func(event-type: string, payload: list<u8>, guild-id: u64, channel-id: u64);
+    initialize: func(settings: option<string>) -> result<_, string>;
+    handle-event: func(event-type: string, payload: list<u8>, guild-id: u64, channel-id: u64) -> result<_, string>;
+    shutdown: func() -> result<_, string>;
 }
 
 world plugin-world {
