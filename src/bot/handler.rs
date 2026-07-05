@@ -4,6 +4,7 @@ use anyhow::Result;
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use twilight_gateway::{CloseFrame, Intents, Message, Shard};
+use twilight_model::gateway::event::GatewayEventDeserializer;
 use twilight_model::gateway::ShardId;
 
 const GATEWAY_BOT_URL: &str = "https://discord.com/api/v10/gateway/bot";
@@ -111,23 +112,29 @@ async fn bot_loop(
             Message::Close(_) => break,
         };
 
+        let Some(gateway_deserializer) = GatewayEventDeserializer::from_json(&text) else {
+            tracing::debug!(?shard_id, "Failed to parse gateway frame header");
+            continue;
+        };
+
+        // Only dispatch op 0 events to plugins; all other opcodes are internal.
+        if gateway_deserializer.op() != 0 {
+            continue;
+        }
+
+        let event_name = gateway_deserializer
+            .event_type()
+            .unwrap_or("UNKNOWN")
+            .to_string();
+
         let payload: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
-                tracing::debug!(?e, ?shard_id, "Failed to parse gateway message");
+                tracing::debug!(?e, ?shard_id, event = %event_name, "Failed to parse gateway payload");
                 continue;
             }
         };
 
-        if payload.get("op").and_then(|v| v.as_u64()) != Some(0) {
-            continue;
-        }
-
-        let event_name = payload
-            .get("t")
-            .and_then(|v| v.as_str())
-            .unwrap_or("UNKNOWN")
-            .to_string();
         let data = payload.get("d").cloned().unwrap_or_default();
         let data_bytes = serde_json::to_vec(&data)?;
 
