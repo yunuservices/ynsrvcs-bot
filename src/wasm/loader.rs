@@ -29,8 +29,100 @@ pub struct PluginPermissions {
     pub kv: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct PluginLimits {
+    #[serde(default = "default_max_memory_bytes")]
+    pub max_memory_bytes: usize,
+    #[serde(default = "default_max_instances")]
+    pub max_instances: usize,
+    #[serde(default = "default_max_tables")]
+    pub max_tables: usize,
+    #[serde(default = "default_max_memories")]
+    pub max_memories: usize,
+}
+
+impl Default for PluginLimits {
+    fn default() -> Self {
+        Self {
+            max_memory_bytes: default_max_memory_bytes(),
+            max_instances: default_max_instances(),
+            max_tables: default_max_tables(),
+            max_memories: default_max_memories(),
+        }
+    }
+}
+
+fn default_max_memory_bytes() -> usize {
+    64 * 1024 * 1024 // 64 MiB
+}
+
+fn default_max_instances() -> usize {
+    10
+}
+
+fn default_max_tables() -> usize {
+    10
+}
+
+fn default_max_memories() -> usize {
+    1
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub struct PluginConfig {
+    #[serde(flatten)]
+    pub permissions: PluginPermissions,
+    #[serde(default)]
+    pub limits: PluginLimits,
+}
+
+pub struct PluginResourceLimiter {
+    limits: PluginLimits,
+}
+
+impl PluginResourceLimiter {
+    fn new(limits: PluginLimits) -> Self {
+        Self { limits }
+    }
+}
+
+impl wasmtime::ResourceLimiter for PluginResourceLimiter {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> std::result::Result<bool, wasmtime::Error> {
+        Ok(desired <= self.limits.max_memory_bytes)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> std::result::Result<bool, wasmtime::Error> {
+        Ok(true)
+    }
+
+    fn instances(&self) -> usize {
+        self.limits.max_instances
+    }
+
+    fn memories(&self) -> usize {
+        self.limits.max_memories
+    }
+
+    fn tables(&self) -> usize {
+        self.limits.max_tables
+    }
+}
+
 const PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const PLUGIN_FUEL: u64 = 50_000_000;
+const FUEL_ASYNC_YIELD_INTERVAL: u64 = 10_000;
+const PLUGIN_HOSTCALL_FUEL: usize = 1_000_000;
 
 pub struct HostContext {
     wasi: WasiCtx,
@@ -39,7 +131,8 @@ pub struct HostContext {
     gateway_ping_ms: Arc<AtomicU64>,
     kv: KvStore,
     workspace: PathBuf,
-    permissions: PluginPermissions,
+    config: PluginConfig,
+    limiter: PluginResourceLimiter,
 }
 
 impl HostContext {
@@ -47,7 +140,7 @@ impl HostContext {
         gateway_ping_ms: Arc<AtomicU64>,
         kv: KvStore,
         workspace: PathBuf,
-        permissions: PluginPermissions,
+        config: PluginConfig,
     ) -> Self {
         Self {
             wasi: WasiCtxBuilder::new().build(),
@@ -56,7 +149,8 @@ impl HostContext {
             gateway_ping_ms,
             kv,
             workspace,
-            permissions,
+            limiter: PluginResourceLimiter::new(config.limits),
+            config,
         }
     }
 }
@@ -81,7 +175,7 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
         url: String,
         body: Vec<u8>,
     ) -> Result<plugin::ynsrvcs::plugins::host::Response, String> {
-        if !self.permissions.http {
+        if !self.config.permissions.http {
             return Err("http requests are not permitted".to_string());
         }
 
@@ -106,7 +200,7 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
     }
 
     async fn get_env(&mut self, name: String) -> Option<String> {
-        if !self.permissions.env {
+        if !self.config.permissions.env {
             return None;
         }
 
@@ -136,7 +230,7 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
     }
 
     async fn kv_get(&mut self, scope: String, key: String) -> Option<Vec<u8>> {
-        if !self.permissions.kv {
+        if !self.config.permissions.kv {
             return None;
         }
 
@@ -144,7 +238,7 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
     }
 
     async fn kv_set(&mut self, scope: String, key: String, value: Vec<u8>) {
-        if !self.permissions.kv {
+        if !self.config.permissions.kv {
             return;
         }
 
@@ -152,7 +246,7 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
     }
 
     async fn fs_read(&mut self, path: String) -> Result<Vec<u8>, String> {
-        if !self.permissions.fs_read {
+        if !self.config.permissions.fs_read {
             return Err("fs read is not permitted".to_string());
         }
 
@@ -162,7 +256,7 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
     }
 
     async fn fs_write(&mut self, path: String, content: Vec<u8>) -> Result<(), String> {
-        if !self.permissions.fs_write {
+        if !self.config.permissions.fs_write {
             return Err("fs write is not permitted".to_string());
         }
 
@@ -180,7 +274,7 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
 
 pub(crate) struct LoadedPlugin {
     component: Arc<Component>,
-    permissions: PluginPermissions,
+    config: PluginConfig,
 }
 
 #[derive(Clone)]
@@ -201,23 +295,31 @@ fn workspace_path(name: &str) -> PathBuf {
     plugin_dir().join(name).join("workspace")
 }
 
-async fn load_permissions(wasm_path: &Path) -> PluginPermissions {
+async fn load_plugin_config(wasm_path: &Path) -> PluginConfig {
     let config_path = wasm_path.with_extension("json");
 
     if !config_path.exists() {
-        return PluginPermissions::default();
+        return PluginConfig::default();
     }
 
     match tokio::fs::read_to_string(&config_path).await {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
         Err(err) => {
             tracing::warn!(
-                "Failed to read permission config at {}: {err}",
+                "Failed to read plugin config at {}: {err}",
                 config_path.display()
             );
-            PluginPermissions::default()
+            PluginConfig::default()
         }
     }
+}
+
+fn configure_store(store: &mut Store<HostContext>) -> Result<()> {
+    store.set_fuel(PLUGIN_FUEL)?;
+    store.fuel_async_yield_interval(Some(FUEL_ASYNC_YIELD_INTERVAL))?;
+    store.set_hostcall_fuel(PLUGIN_HOSTCALL_FUEL);
+    store.limiter(|state| &mut state.limiter);
+    Ok(())
 }
 
 fn create_linker(engine: &Engine) -> Result<Linker<HostContext>> {
@@ -301,13 +403,15 @@ impl PluginManager {
 
         let component = Component::new(engine, &bytes)?;
         let workspace = workspace_path(&name);
-        let permissions = load_permissions(wasm_path).await;
+        let config = load_plugin_config(wasm_path).await;
         tokio::fs::create_dir_all(&workspace).await?;
 
         let mut store = Store::new(
             engine,
-            HostContext::new(gateway_ping_ms, kv.clone(), workspace.clone(), permissions),
+            HostContext::new(gateway_ping_ms, kv.clone(), workspace.clone(), config),
         );
+        configure_store(&mut store)?;
+
         let linker = create_linker(engine)?;
         let instance =
             plugin::PluginWorld::instantiate_async(&mut store, &component, &linker).await?;
@@ -326,7 +430,7 @@ impl PluginManager {
             name,
             LoadedPlugin {
                 component: Arc::new(component),
-                permissions,
+                config,
             },
         ))
     }
@@ -348,19 +452,22 @@ impl PluginManager {
             let plugins = self.plugins.lock().await;
             plugins
                 .get(name)
-                .map(|loaded| (Arc::clone(&loaded.component), loaded.permissions))
+                .map(|loaded| (Arc::clone(&loaded.component), loaded.config))
         };
 
-        if let Some((component, permissions)) = maybe_loaded {
+        if let Some((component, config)) = maybe_loaded {
             let mut store = Store::new(
                 &self.engine,
                 HostContext::new(
                     Arc::clone(&self.gateway_ping_ms),
                     self.kv.clone(),
                     workspace_path(name),
-                    permissions,
+                    config,
                 ),
             );
+            if let Err(err) = configure_store(&mut store) {
+                tracing::error!("Failed to configure store for {name} shutdown: {err}");
+            }
             let linker = match create_linker(&self.engine) {
                 Ok(l) => l,
                 Err(e) => {
@@ -432,13 +539,13 @@ impl PluginManager {
                     (
                         name.clone(),
                         Arc::clone(&loaded.component),
-                        loaded.permissions,
+                        loaded.config,
                     )
                 })
                 .collect::<Vec<_>>()
         };
 
-        for (name, component, permissions) in plugins {
+        for (name, component, config) in plugins {
             let engine = Arc::clone(&self.engine);
             let gateway_ping_ms = Arc::clone(&self.gateway_ping_ms);
             let kv = self.kv.clone();
@@ -450,8 +557,12 @@ impl PluginManager {
             let handle = async move {
                 let mut store = Store::new(
                     &engine,
-                    HostContext::new(gateway_ping_ms, kv, workspace, permissions),
+                    HostContext::new(gateway_ping_ms, kv, workspace, config),
                 );
+                if let Err(err) = configure_store(&mut store) {
+                    tracing::error!("Failed to configure store for {name}: {err}");
+                    return;
+                }
                 let linker = match create_linker(&engine) {
                     Ok(l) => l,
                     Err(e) => {
