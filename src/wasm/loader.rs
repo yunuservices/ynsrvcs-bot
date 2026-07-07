@@ -300,6 +300,206 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
         Ok(plugin::ynsrvcs::plugins::host::Response { status, body })
     }
 
+    async fn send_channel_message_with_components(
+        &mut self,
+        channel_id: u64,
+        content: String,
+        components: String,
+    ) -> Result<plugin::ynsrvcs::plugins::host::Response, String> {
+        if !self.config.permissions.http {
+            return Err("http requests are not permitted".to_string());
+        }
+
+        let token =
+            std::env::var("DISCORD_TOKEN").map_err(|_| "DISCORD_TOKEN not set".to_string())?;
+        let components_json: serde_json::Value = if components.trim().is_empty() {
+            serde_json::Value::Array(Vec::new())
+        } else {
+            serde_json::from_str(&components)
+                .map_err(|e| format!("invalid components json: {e}"))?
+        };
+
+        let body = serde_json::json!({
+            "content": content,
+            "components": components_json,
+        });
+
+        let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {token}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let status = resp.status().as_u16();
+        let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+        if status >= 400 {
+            tracing::warn!(
+                status,
+                url,
+                text = %String::from_utf8_lossy(&body_bytes),
+                "send_channel_message_with_components failed"
+            );
+        }
+
+        Ok(plugin::ynsrvcs::plugins::host::Response {
+            status,
+            body: body_bytes,
+        })
+    }
+
+    async fn reply_to_interaction(
+        &mut self,
+        interaction_id: u64,
+        interaction_token: String,
+        content: String,
+        ephemeral: bool,
+    ) -> Result<(), String> {
+        if !self.config.permissions.http {
+            return Err("http requests are not permitted".to_string());
+        }
+
+        let token =
+            std::env::var("DISCORD_TOKEN").map_err(|_| "DISCORD_TOKEN not set".to_string())?;
+        let mut data = serde_json::json!({
+            "content": content,
+        });
+        if ephemeral {
+            data["flags"] = 64.into();
+        }
+
+        let body = serde_json::json!({
+            "type": 4,
+            "data": data,
+        });
+
+        let url = format!(
+            "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {token}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            Err(format!("interaction reply failed ({status}): {text}"))
+        }
+    }
+
+    async fn edit_interaction_message(
+        &mut self,
+        interaction_token: String,
+        content: String,
+        components: String,
+    ) -> Result<(), String> {
+        if !self.config.permissions.http {
+            return Err("http requests are not permitted".to_string());
+        }
+
+        let app_id = self.application_id.load(Ordering::Relaxed).to_string();
+        if app_id == "0" {
+            return Err("application id not available".to_string());
+        }
+
+        let token =
+            std::env::var("DISCORD_TOKEN").map_err(|_| "DISCORD_TOKEN not set".to_string())?;
+        let components_json: serde_json::Value = if components.trim().is_empty() {
+            serde_json::Value::Array(Vec::new())
+        } else {
+            serde_json::from_str(&components)
+                .map_err(|e| format!("invalid components json: {e}"))?
+        };
+
+        let body = serde_json::json!({
+            "content": content,
+            "components": components_json,
+        });
+
+        let url = format!(
+            "https://discord.com/api/v10/webhooks/{app_id}/{interaction_token}/messages/@original"
+        );
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bot {token}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            Err(format!(
+                "edit interaction message failed ({status}): {text}"
+            ))
+        }
+    }
+
+    async fn show_modal(
+        &mut self,
+        interaction_id: u64,
+        interaction_token: String,
+        title: String,
+        custom_id: String,
+        components: String,
+    ) -> Result<(), String> {
+        if !self.config.permissions.http {
+            return Err("http requests are not permitted".to_string());
+        }
+
+        let token =
+            std::env::var("DISCORD_TOKEN").map_err(|_| "DISCORD_TOKEN not set".to_string())?;
+        let components_json: serde_json::Value = serde_json::from_str(&components)
+            .map_err(|e| format!("invalid components json: {e}"))?;
+
+        let body = serde_json::json!({
+            "type": 9,
+            "data": {
+                "custom_id": custom_id,
+                "title": title,
+                "components": components_json,
+            }
+        });
+
+        let url = format!(
+            "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {token}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            Err(format!("show modal failed ({status}): {text}"))
+        }
+    }
+
     async fn get_env(&mut self, name: String) -> Option<String> {
         if !self.config.permissions.env {
             return None;

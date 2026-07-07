@@ -14,6 +14,10 @@ interface host {
 
     http-request: func(method: string, url: string, body: list<u8>) -> result<response, string>;
     send-channel-message-with-attachments: func(channel-id: u64, content: string, attachments: list<attachment>) -> result<response, string>;
+    send-channel-message-with-components: func(channel-id: u64, content: string, components: string) -> result<response, string>;
+    reply-to-interaction: func(interaction-id: u64, interaction-token: string, content: string, ephemeral: bool) -> result<_, string>;
+    edit-interaction-message: func(interaction-token: string, content: string, components: string) -> result<_, string>;
+    show-modal: func(interaction-id: u64, interaction-token: string, title: string, custom-id: string, components: string) -> result<_, string>;
     application-id: func() -> option<string>;
     update-presence: func(status: string, activity-type: u8, activity-name: string) -> result<_, string>;
     update-voice-state: func(guild-id: u64, channel-id: option<u64>, self-mute: bool, self-deaf: bool) -> result<_, string>;
