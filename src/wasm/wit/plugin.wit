@@ -19,6 +19,8 @@ interface host {
     update-voice-state: func(guild-id: u64, channel-id: option<u64>, self-mute: bool, self-deaf: bool) -> result<_, string>;
     join-voice-channel: func(guild-id: u64, channel-id: u64, self-mute: bool, self-deaf: bool) -> result<_, string>;
     leave-voice-channel: func(guild-id: u64) -> result<_, string>;
+    play-audio-url: func(guild-id: u64, url: string) -> result<_, string>;
+    stop-audio: func(guild-id: u64) -> result<_, string>;
     request-guild-members: func(guild-id: u64) -> result<_, string>;
     get-env: func(name: string) -> option<string>;
     gateway-ping: func() -> u64;

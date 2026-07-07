@@ -1,11 +1,17 @@
+use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use anyhow::Result;
+use songbird::{Songbird, shards::TwilightMap};
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use twilight_gateway::{CloseFrame, Intents, Message, MessageSender, Shard};
 use twilight_model::gateway::ShardId;
-use twilight_model::gateway::event::GatewayEventDeserializer;
+use twilight_model::gateway::event::{Event as GatewayEvent, GatewayEventDeserializer};
+use twilight_model::gateway::payload::incoming::{VoiceServerUpdate, VoiceStateUpdate};
+use twilight_model::id::Id;
+use twilight_model::id::marker::UserMarker;
 
 const GATEWAY_BOT_URL: &str = "https://discord.com/api/v10/gateway/bot";
 const HTTP_TIMEOUT_SECONDS: u64 = 15;
@@ -147,6 +153,15 @@ async fn bot_loop(
                 .get("user")
                 .and_then(|u| u.get("username"))
                 .and_then(|v| v.as_str());
+            if let Some(user_id) = data
+                .get("user")
+                .and_then(|u| u.get("id"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                && let Some(nz) = NonZeroU64::new(user_id)
+            {
+                init_songbird(&manager, Id::<UserMarker>::new(nz.get())).await;
+            }
             if let Some(app_id) = data
                 .get("application")
                 .and_then(|a| a.get("id"))
@@ -156,6 +171,24 @@ async fn bot_loop(
                 manager.set_application_id(app_id);
             }
             tracing::info!(user = ?user, ?shard_id, "Bot is ready");
+        }
+
+        match event_name.as_str() {
+            "VOICE_STATE_UPDATE" => {
+                if let Ok(event) = serde_json::from_value::<Box<VoiceStateUpdate>>(data.clone()) {
+                    manager
+                        .process_voice_event(GatewayEvent::VoiceStateUpdate(event))
+                        .await;
+                }
+            }
+            "VOICE_SERVER_UPDATE" => {
+                if let Ok(event) = serde_json::from_value::<VoiceServerUpdate>(data.clone()) {
+                    manager
+                        .process_voice_event(GatewayEvent::VoiceServerUpdate(event))
+                        .await;
+                }
+            }
+            _ => {}
         }
 
         let guild_id = data
@@ -189,4 +222,17 @@ async fn bot_loop(
     }
 
     Ok(())
+}
+
+async fn init_songbird(manager: &crate::wasm::loader::PluginManager, user_id: Id<UserMarker>) {
+    let senders = manager.clone_shard_senders().await;
+    let mut shard_map = HashMap::with_capacity(senders.len());
+    for (idx, sender) in senders.into_iter().enumerate() {
+        shard_map.insert(idx as u32, sender);
+    }
+
+    let twilight_map = Arc::new(TwilightMap::new(shard_map));
+    let songbird = Songbird::twilight(twilight_map, user_id);
+    manager.set_songbird(songbird).await;
+    tracing::info!(%user_id, "Songbird voice driver ready");
 }

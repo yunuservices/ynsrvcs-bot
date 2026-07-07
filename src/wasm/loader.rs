@@ -7,9 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::Deserialize;
+use songbird::Songbird;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 use twilight_gateway::MessageSender;
+use twilight_model::gateway::event::Event as GatewayEvent;
 use twilight_model::gateway::payload::outgoing::{
     RequestGuildMembers, UpdatePresence, UpdateVoiceState,
 };
@@ -145,6 +147,7 @@ pub struct HostContext {
     application_id: Arc<AtomicU64>,
     shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
     shard_count: Arc<AtomicU64>,
+    songbird: Arc<AsyncMutex<Option<Songbird>>>,
     kv: KvStore,
     workspace: PathBuf,
     config: PluginConfig,
@@ -152,11 +155,13 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gateway_ping_ms: Arc<AtomicU64>,
         application_id: Arc<AtomicU64>,
         shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
         shard_count: Arc<AtomicU64>,
+        songbird: Arc<AsyncMutex<Option<Songbird>>>,
         kv: KvStore,
         workspace: PathBuf,
         config: PluginConfig,
@@ -169,6 +174,7 @@ impl HostContext {
             application_id,
             shard_senders,
             shard_count,
+            songbird,
             kv,
             workspace,
             limiter: PluginResourceLimiter::new(config.limits),
@@ -423,6 +429,46 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
         self.update_voice_state(guild_id, None, false, false).await
     }
 
+    async fn play_audio_url(&mut self, guild_id: u64, url: String) -> Result<(), String> {
+        let guild_id = NonZeroU64::new(guild_id)
+            .map(|nz| Id::<GuildMarker>::new(nz.get()))
+            .ok_or_else(|| "invalid guild id".to_string())?;
+
+        let songbird_guard = self.songbird.lock().await;
+        let songbird = songbird_guard
+            .as_ref()
+            .ok_or_else(|| "voice driver not ready".to_string())?;
+
+        let call = songbird
+            .get(guild_id)
+            .ok_or_else(|| "bot is not in a voice channel".to_string())?;
+        let mut call = call.lock().await;
+
+        let input: songbird::input::Input =
+            songbird::input::HttpRequest::new(self.client.clone(), url).into();
+        call.play_input(input);
+        Ok(())
+    }
+
+    async fn stop_audio(&mut self, guild_id: u64) -> Result<(), String> {
+        let guild_id = NonZeroU64::new(guild_id)
+            .map(|nz| Id::<GuildMarker>::new(nz.get()))
+            .ok_or_else(|| "invalid guild id".to_string())?;
+
+        let songbird_guard = self.songbird.lock().await;
+        let songbird = songbird_guard
+            .as_ref()
+            .ok_or_else(|| "voice driver not ready".to_string())?;
+
+        let call = songbird
+            .get(guild_id)
+            .ok_or_else(|| "bot is not in a voice channel".to_string())?;
+        let mut call = call.lock().await;
+
+        call.stop();
+        Ok(())
+    }
+
     async fn now_ms(&mut self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -497,6 +543,7 @@ pub struct PluginManager {
     application_id: Arc<AtomicU64>,
     shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
     shard_count: Arc<AtomicU64>,
+    songbird: Arc<AsyncMutex<Option<Songbird>>>,
     kv: KvStore,
 }
 
@@ -553,6 +600,7 @@ impl PluginManager {
             application_id: Arc::new(AtomicU64::new(0)),
             shard_senders: Arc::new(AsyncMutex::new(Vec::new())),
             shard_count: Arc::new(AtomicU64::new(0)),
+            songbird: Arc::new(AsyncMutex::new(None)),
             kv: KvStore::load_or_default(super::kv::kv_path())?,
         })
     }
@@ -569,8 +617,22 @@ impl PluginManager {
         *self.shard_senders.lock().await = senders;
     }
 
+    pub async fn clone_shard_senders(&self) -> Vec<MessageSender> {
+        self.shard_senders.lock().await.clone()
+    }
+
     pub fn set_shard_count(&self, count: u64) {
         self.shard_count.store(count, Ordering::Relaxed);
+    }
+
+    pub async fn set_songbird(&self, songbird: Songbird) {
+        *self.songbird.lock().await = Some(songbird);
+    }
+
+    pub async fn process_voice_event(&self, event: GatewayEvent) {
+        if let Some(songbird) = self.songbird.lock().await.as_ref() {
+            songbird.process(&event).await;
+        }
     }
 
     pub async fn load_all(&self) -> Result<()> {
@@ -597,6 +659,7 @@ impl PluginManager {
                 Arc::clone(&self.application_id),
                 Arc::clone(&self.shard_senders),
                 Arc::clone(&self.shard_count),
+                Arc::clone(&self.songbird),
                 self.kv.clone(),
                 wasm_path,
             )
@@ -625,12 +688,14 @@ impl PluginManager {
             .to_string()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load_one(
         engine: &Engine,
         gateway_ping_ms: Arc<AtomicU64>,
         application_id: Arc<AtomicU64>,
         shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
         shard_count: Arc<AtomicU64>,
+        songbird: Arc<AsyncMutex<Option<Songbird>>>,
         kv: KvStore,
         wasm_path: &Path,
     ) -> Result<(String, LoadedPlugin)> {
@@ -649,6 +714,7 @@ impl PluginManager {
                 application_id,
                 shard_senders,
                 shard_count,
+                songbird,
                 kv.clone(),
                 workspace.clone(),
                 config,
@@ -686,6 +752,7 @@ impl PluginManager {
             Arc::clone(&self.application_id),
             Arc::clone(&self.shard_senders),
             Arc::clone(&self.shard_count),
+            Arc::clone(&self.songbird),
             self.kv.clone(),
             wasm_path,
         )
@@ -710,6 +777,7 @@ impl PluginManager {
                     Arc::clone(&self.application_id),
                     Arc::clone(&self.shard_senders),
                     Arc::clone(&self.shard_count),
+                    Arc::clone(&self.songbird),
                     self.kv.clone(),
                     workspace_path(name),
                     config,
@@ -795,6 +863,7 @@ impl PluginManager {
             let application_id = Arc::clone(&self.application_id);
             let shard_senders = Arc::clone(&self.shard_senders);
             let shard_count = Arc::clone(&self.shard_count);
+            let songbird = Arc::clone(&self.songbird);
             let kv = self.kv.clone();
             let kv_for_save = kv.clone();
             let workspace = workspace_path(&name);
@@ -809,6 +878,7 @@ impl PluginManager {
                         application_id,
                         shard_senders,
                         shard_count,
+                        songbird,
                         kv,
                         workspace,
                         config,
@@ -926,6 +996,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AsyncMutex::new(Vec::new())),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AsyncMutex::new(None)),
             KvStore::with_path(std::env::temp_dir().join("ynsrvcs-test-kv.json")),
             &wasm_path,
         )
