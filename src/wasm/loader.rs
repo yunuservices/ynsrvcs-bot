@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +37,8 @@ pub struct PluginPermissions {
     pub env: bool,
     #[serde(default)]
     pub kv: bool,
+    #[serde(default)]
+    pub bus: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -134,6 +136,12 @@ const PLUGIN_FUEL: u64 = 50_000_000;
 const FUEL_ASYNC_YIELD_INTERVAL: u64 = 10_000;
 const PLUGIN_HOSTCALL_FUEL: usize = 1_000_000;
 
+#[derive(Clone)]
+pub(crate) struct BusMessage {
+    topic: String,
+    payload: Vec<u8>,
+}
+
 fn is_discord_api_url(url: &str) -> bool {
     url.starts_with("https://discord.com/api/")
         || url.starts_with("https://canary.discord.com/api/")
@@ -148,6 +156,9 @@ pub struct HostContext {
     shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
     shard_count: Arc<AtomicU64>,
     songbird: Arc<AsyncMutex<Option<Songbird>>>,
+    bus_subscriptions: Arc<AsyncMutex<HashMap<String, HashSet<String>>>>,
+    bus_queue: Arc<AsyncMutex<HashMap<String, VecDeque<BusMessage>>>>,
+    plugin_name: String,
     kv: KvStore,
     workspace: PathBuf,
     config: PluginConfig,
@@ -156,12 +167,15 @@ pub struct HostContext {
 
 impl HostContext {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         gateway_ping_ms: Arc<AtomicU64>,
         application_id: Arc<AtomicU64>,
         shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
         shard_count: Arc<AtomicU64>,
         songbird: Arc<AsyncMutex<Option<Songbird>>>,
+        bus_subscriptions: Arc<AsyncMutex<HashMap<String, HashSet<String>>>>,
+        bus_queue: Arc<AsyncMutex<HashMap<String, VecDeque<BusMessage>>>>,
+        plugin_name: String,
         kv: KvStore,
         workspace: PathBuf,
         config: PluginConfig,
@@ -175,6 +189,9 @@ impl HostContext {
             shard_senders,
             shard_count,
             songbird,
+            bus_subscriptions,
+            bus_queue,
+            plugin_name,
             kv,
             workspace,
             limiter: PluginResourceLimiter::new(config.limits),
@@ -805,6 +822,44 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn bus_subscribe(&mut self, topics: Vec<String>) -> Result<(), String> {
+        if !self.config.permissions.bus {
+            return Err("bus access is not permitted".to_string());
+        }
+
+        self.bus_subscriptions
+            .lock()
+            .await
+            .entry(self.plugin_name.clone())
+            .or_default()
+            .extend(topics);
+        Ok(())
+    }
+
+    async fn bus_publish(&mut self, topic: String, payload: Vec<u8>) -> Result<(), String> {
+        if !self.config.permissions.bus {
+            return Err("bus access is not permitted".to_string());
+        }
+
+        let subscriptions = self.bus_subscriptions.lock().await;
+        let mut queue = self.bus_queue.lock().await;
+        for (subscriber, subscribed_topics) in subscriptions.iter() {
+            if subscriber == &self.plugin_name {
+                continue;
+            }
+            if subscribed_topics.contains(&topic) {
+                queue
+                    .entry(subscriber.clone())
+                    .or_default()
+                    .push_back(BusMessage {
+                        topic: topic.clone(),
+                        payload: payload.clone(),
+                    });
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct LoadedPlugin {
@@ -824,6 +879,8 @@ pub struct PluginManager {
     shard_count: Arc<AtomicU64>,
     songbird: Arc<AsyncMutex<Option<Songbird>>>,
     plugin_failures: Arc<AsyncMutex<HashMap<String, u32>>>,
+    bus_subscriptions: Arc<AsyncMutex<HashMap<String, HashSet<String>>>>,
+    bus_queue: Arc<AsyncMutex<HashMap<String, VecDeque<BusMessage>>>>,
     kv: KvStore,
 }
 
@@ -882,6 +939,8 @@ impl PluginManager {
             shard_count: Arc::new(AtomicU64::new(0)),
             songbird: Arc::new(AsyncMutex::new(None)),
             plugin_failures: Arc::new(AsyncMutex::new(HashMap::new())),
+            bus_subscriptions: Arc::new(AsyncMutex::new(HashMap::new())),
+            bus_queue: Arc::new(AsyncMutex::new(HashMap::new())),
             kv: KvStore::load_or_default(super::kv::kv_path())?,
         })
     }
@@ -941,6 +1000,8 @@ impl PluginManager {
                 Arc::clone(&self.shard_senders),
                 Arc::clone(&self.shard_count),
                 Arc::clone(&self.songbird),
+                Arc::clone(&self.bus_subscriptions),
+                Arc::clone(&self.bus_queue),
                 self.kv.clone(),
                 wasm_path,
             )
@@ -977,6 +1038,8 @@ impl PluginManager {
         shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
         shard_count: Arc<AtomicU64>,
         songbird: Arc<AsyncMutex<Option<Songbird>>>,
+        bus_subscriptions: Arc<AsyncMutex<HashMap<String, HashSet<String>>>>,
+        bus_queue: Arc<AsyncMutex<HashMap<String, VecDeque<BusMessage>>>>,
         kv: KvStore,
         wasm_path: &Path,
     ) -> Result<(String, LoadedPlugin)> {
@@ -996,6 +1059,9 @@ impl PluginManager {
                 shard_senders,
                 shard_count,
                 songbird,
+                bus_subscriptions,
+                bus_queue,
+                name.clone(),
                 kv.clone(),
                 workspace.clone(),
                 config,
@@ -1034,6 +1100,8 @@ impl PluginManager {
             Arc::clone(&self.shard_senders),
             Arc::clone(&self.shard_count),
             Arc::clone(&self.songbird),
+            Arc::clone(&self.bus_subscriptions),
+            Arc::clone(&self.bus_queue),
             self.kv.clone(),
             wasm_path,
         )
@@ -1054,6 +1122,8 @@ impl PluginManager {
             Arc::clone(&self.shard_senders),
             Arc::clone(&self.shard_count),
             Arc::clone(&self.songbird),
+            Arc::clone(&self.bus_subscriptions),
+            Arc::clone(&self.bus_queue),
             self.kv.clone(),
             wasm_path,
         )
@@ -1094,6 +1164,9 @@ impl PluginManager {
                     Arc::clone(&self.shard_senders),
                     Arc::clone(&self.shard_count),
                     Arc::clone(&self.songbird),
+                    Arc::clone(&self.bus_subscriptions),
+                    Arc::clone(&self.bus_queue),
+                    name.to_string(),
                     self.kv.clone(),
                     workspace_path(name),
                     config,
@@ -1200,6 +1273,9 @@ impl PluginManager {
                         shard_senders,
                         shard_count,
                         songbird,
+                        Arc::clone(&manager.bus_subscriptions),
+                        Arc::clone(&manager.bus_queue),
+                        name.clone(),
                         kv,
                         workspace,
                         config,
@@ -1274,6 +1350,92 @@ impl PluginManager {
 
             handle.await;
         }
+
+        self.flush_bus_events().await;
+    }
+
+    async fn flush_bus_events(&self) {
+        let work: Vec<(String, Vec<BusMessage>, Arc<Component>, PluginConfig)> = {
+            let mut queue = self.bus_queue.lock().await;
+            let plugins = self.plugins.lock().await;
+            let subscriptions = self.bus_subscriptions.lock().await;
+
+            subscriptions
+                .keys()
+                .filter_map(|name| {
+                    let messages: Vec<BusMessage> = queue.get_mut(name)?.drain(..).collect();
+                    if messages.is_empty() {
+                        return None;
+                    }
+                    let loaded = plugins.get(name)?;
+                    Some((
+                        name.clone(),
+                        messages,
+                        Arc::clone(&loaded.component),
+                        loaded.config,
+                    ))
+                })
+                .collect()
+        };
+
+        for (name, messages, component, config) in work {
+            let engine = Arc::clone(&self.engine);
+            let gateway_ping_ms = Arc::clone(&self.gateway_ping_ms);
+            let application_id = Arc::clone(&self.application_id);
+            let shard_senders = Arc::clone(&self.shard_senders);
+            let shard_count = Arc::clone(&self.shard_count);
+            let songbird = Arc::clone(&self.songbird);
+            let bus_subscriptions = Arc::clone(&self.bus_subscriptions);
+            let bus_queue = Arc::clone(&self.bus_queue);
+            let kv = self.kv.clone();
+            let workspace = workspace_path(&name);
+
+            let mut store = Store::new(
+                &engine,
+                HostContext::new(
+                    gateway_ping_ms,
+                    application_id,
+                    shard_senders,
+                    shard_count,
+                    songbird,
+                    bus_subscriptions,
+                    bus_queue,
+                    name.clone(),
+                    kv,
+                    workspace,
+                    config,
+                ),
+            );
+            if let Err(err) = configure_store(&mut store) {
+                tracing::error!("Failed to configure store for {name} bus event: {err}");
+                continue;
+            }
+            let linker = match create_linker(&engine) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to create linker for {name} bus event: {e}");
+                    continue;
+                }
+            };
+
+            let instance =
+                match plugin::PluginWorld::instantiate_async(&mut store, &component, &linker).await
+                {
+                    Ok(i) => i,
+                    Err(e) => {
+                        tracing::error!("Failed to instantiate {name} for bus event: {e}");
+                        continue;
+                    }
+                };
+
+            let guest = instance.ynsrvcs_plugins_plugin();
+            for BusMessage { topic, payload } in messages {
+                let fut = guest.call_handle_bus_event(&mut store, &topic, &payload);
+                if let Err(e) = tokio::time::timeout(PLUGIN_CALL_TIMEOUT, fut).await {
+                    tracing::error!("Bus event {topic} for {name} timed out: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -1337,6 +1499,8 @@ mod tests {
             Arc::new(AsyncMutex::new(Vec::new())),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AsyncMutex::new(None)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             KvStore::with_path(std::env::temp_dir().join("ynsrvcs-test-kv.json")),
             &wasm_path,
         )

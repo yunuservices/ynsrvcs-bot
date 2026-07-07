@@ -40,11 +40,15 @@ interface host {
 
     fs-read: func(path: string) -> result<list<u8>, string>;
     fs-write: func(path: string, content: list<u8>) -> result<_, string>;
+
+    bus-subscribe: func(topics: list<string>) -> result<_, string>;
+    bus-publish: func(topic: string, payload: list<u8>) -> result<_, string>;
 }
 
 interface plugin {
     initialize: func(settings: option<string>) -> result<_, string>;
     handle-event: func(event-type: string, payload: list<u8>, guild-id: u64, channel-id: u64) -> result<_, string>;
+    handle-bus-event: func(topic: string, payload: list<u8>) -> result<_, string>;
     shutdown: func() -> result<_, string>;
 }
 

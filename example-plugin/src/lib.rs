@@ -72,6 +72,10 @@ impl Guest for PingPlugin {
         Ok(())
     }
 
+    fn handle_bus_event(_topic: String, _payload: Vec<u8>) -> Result<(), String> {
+        Ok(())
+    }
+
     fn handle_event(
         event_type: String,
         payload: Vec<u8>,
