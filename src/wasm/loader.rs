@@ -812,6 +812,8 @@ pub(crate) struct LoadedPlugin {
     config: PluginConfig,
 }
 
+const PLUGIN_FAILURE_THRESHOLD: u32 = 5;
+
 #[derive(Clone)]
 pub struct PluginManager {
     plugins: Arc<AsyncMutex<HashMap<String, LoadedPlugin>>>,
@@ -821,6 +823,7 @@ pub struct PluginManager {
     shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
     shard_count: Arc<AtomicU64>,
     songbird: Arc<AsyncMutex<Option<Songbird>>>,
+    plugin_failures: Arc<AsyncMutex<HashMap<String, u32>>>,
     kv: KvStore,
 }
 
@@ -878,6 +881,7 @@ impl PluginManager {
             shard_senders: Arc::new(AsyncMutex::new(Vec::new())),
             shard_count: Arc::new(AtomicU64::new(0)),
             songbird: Arc::new(AsyncMutex::new(None)),
+            plugin_failures: Arc::new(AsyncMutex::new(HashMap::new())),
             kv: KvStore::load_or_default(super::kv::kv_path())?,
         })
     }
@@ -1038,6 +1042,41 @@ impl PluginManager {
         Ok(name)
     }
 
+    /// Safely reload a plugin: load the new version first, then shutdown the
+    /// old version. If the new version fails to load, the old plugin stays in
+    /// service.
+    pub async fn reload_plugin(&self, wasm_path: &Path) -> Result<String> {
+        let name = Self::plugin_name(wasm_path);
+        let (loaded_name, loaded) = Self::load_one(
+            &self.engine,
+            Arc::clone(&self.gateway_ping_ms),
+            Arc::clone(&self.application_id),
+            Arc::clone(&self.shard_senders),
+            Arc::clone(&self.shard_count),
+            Arc::clone(&self.songbird),
+            self.kv.clone(),
+            wasm_path,
+        )
+        .await?;
+
+        if loaded_name != name {
+            tracing::warn!(
+                "Reload path {} produced plugin name {}, expected {}",
+                wasm_path.display(),
+                loaded_name,
+                name
+            );
+        }
+
+        if self.is_loaded(&name).await {
+            self.unload(&name).await;
+        }
+
+        self.plugins.lock().await.insert(name.clone(), loaded);
+        self.plugin_failures.lock().await.remove(&name);
+        Ok(name)
+    }
+
     pub async fn unload(&self, name: &str) {
         let maybe_loaded = {
             let plugins = self.plugins.lock().await;
@@ -1134,6 +1173,9 @@ impl PluginManager {
                 .collect::<Vec<_>>()
         };
 
+        let failures = Arc::clone(&self.plugin_failures);
+        let manager = self.clone();
+
         for (name, component, config) in plugins {
             let engine = Arc::clone(&self.engine);
             let gateway_ping_ms = Arc::clone(&self.gateway_ping_ms);
@@ -1146,6 +1188,8 @@ impl PluginManager {
             let workspace = workspace_path(&name);
             let event_type = event_type.to_string();
             let payload = payload.clone();
+            let failures = Arc::clone(&failures);
+            let manager = manager.clone();
 
             let handle = async move {
                 let mut store = Store::new(
@@ -1193,15 +1237,34 @@ impl PluginManager {
                     channel_id,
                 );
 
-                match tokio::time::timeout(PLUGIN_CALL_TIMEOUT, fut).await {
-                    Ok(Ok(Ok(()))) => {}
+                let failed = match tokio::time::timeout(PLUGIN_CALL_TIMEOUT, fut).await {
+                    Ok(Ok(Ok(()))) => {
+                        failures.lock().await.remove(&name);
+                        false
+                    }
                     Ok(Ok(Err(err))) => {
-                        tracing::error!("Plugin {name} error handling {event_type}: {err}")
+                        tracing::error!("Plugin {name} error handling {event_type}: {err}");
+                        true
                     }
                     Ok(Err(err)) => {
-                        tracing::error!("Plugin {name} trapped handling {event_type}: {err}")
+                        tracing::error!("Plugin {name} trapped handling {event_type}: {err}");
+                        true
                     }
-                    Err(_) => tracing::error!("Plugin {name} timed out handling {event_type}"),
+                    Err(_) => {
+                        tracing::error!("Plugin {name} timed out handling {event_type}");
+                        true
+                    }
+                };
+
+                if failed {
+                    let mut map = failures.lock().await;
+                    let count = map.entry(name.clone()).or_insert(0);
+                    *count += 1;
+                    if *count >= PLUGIN_FAILURE_THRESHOLD {
+                        tracing::error!("Plugin {name} exceeded failure threshold; unloading");
+                        drop(map);
+                        manager.unload(&name).await;
+                    }
                 }
 
                 if let Err(err) = kv_for_save.save() {

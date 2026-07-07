@@ -1,8 +1,12 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 use super::loader::{PluginManager, plugin_dir};
 use notify::{RecursiveMode, Watcher};
+
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub async fn watch(manager: PluginManager) {
     let dir = plugin_dir();
@@ -40,22 +44,46 @@ pub async fn watch(manager: PluginManager) {
     info!("Watching plugin directory: {}", dir.display());
 
     while let Some(p) = rx.recv().await {
-        handle_file_event(&manager, &p).await;
+        let mut paths = HashSet::new();
+        paths.insert(p);
+        let mut deadline = Instant::now() + RELOAD_DEBOUNCE;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(next)) => {
+                    paths.insert(next);
+                    deadline = Instant::now() + RELOAD_DEBOUNCE;
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        for path in paths {
+            handle_file_event(&manager, &path).await;
+        }
     }
 }
 
 async fn handle_file_event(manager: &PluginManager, path: &Path) {
-    let name = PluginManager::plugin_name(path);
-
     if path.exists() {
+        match manager.reload_plugin(path).await {
+            Ok(name) => info!("Hot-reloaded plugin: {name}"),
+            Err(e) => tracing::error!(
+                "Failed to hot-reload {}: {e}",
+                PluginManager::plugin_name(path)
+            ),
+        }
+    } else {
+        let name = PluginManager::plugin_name(path);
         if manager.is_loaded(&name).await {
             manager.unload(&name).await;
+            info!("Hot-unloaded plugin: {name}");
         }
-        match manager.load(path).await {
-            Ok(n) => info!("Hot-loaded plugin: {n}"),
-            Err(e) => tracing::error!("Failed to hot-load {name}: {e}"),
-        }
-    } else if manager.is_loaded(&name).await {
-        manager.unload(&name).await;
     }
 }
