@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 use semver::{Version, VersionReq};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -97,6 +98,8 @@ pub(crate) struct ManifestPluginInfo {
     #[serde(default = "default_manifest_version")]
     pub version: Version,
     pub description: Option<String>,
+    #[serde(default)]
+    pub abi_version: u64,
 }
 
 impl Default for ManifestPluginInfo {
@@ -105,6 +108,7 @@ impl Default for ManifestPluginInfo {
             name: None,
             version: default_manifest_version(),
             description: None,
+            abi_version: 0,
         }
     }
 }
@@ -177,12 +181,63 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_FUEL: u64 = 50_000_000;
 const FUEL_ASYNC_YIELD_INTERVAL: u64 = 10_000;
 const PLUGIN_HOSTCALL_FUEL: usize = 1_000_000;
+const PLUGIN_ABI_VERSION: u64 = 1;
+const DISCORD_RATE_LIMIT_MAX_CONCURRENT: usize = 5;
+const DISCORD_REQUEST_MAX_RETRIES: u32 = 3;
 
 #[derive(Clone)]
 pub(crate) struct BusMessage {
     topic: String,
     payload: Vec<u8>,
 }
+
+#[derive(Clone)]
+pub(crate) struct DiscordRateLimiter {
+    global_reset: Arc<AtomicU64>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl DiscordRateLimiter {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            global_reset: Arc::new(AtomicU64::new(0)),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+        }
+    }
+
+    pub async fn acquire(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.semaphore
+            .acquire()
+            .await
+            .expect("semaphore should not be closed")
+    }
+
+    pub async fn wait_for_reset(&self) {
+        let reset_ms = self.global_reset.load(Ordering::Relaxed);
+        if reset_ms == 0 {
+            return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if reset_ms > now {
+            tokio::time::sleep(Duration::from_millis(reset_ms - now)).await;
+        }
+    }
+
+    pub fn mark_rate_limited(&self, retry_after_seconds: u64) {
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+            + retry_after_seconds.saturating_mul(1000)
+            + 100; // small buffer
+        self.global_reset.store(reset, Ordering::Relaxed);
+    }
+}
+
+static GLOBAL_DISCORD_RATE_LIMITER: OnceLock<DiscordRateLimiter> = OnceLock::new();
 
 fn is_discord_api_url(url: &str) -> bool {
     url.starts_with("https://discord.com/api/")
@@ -193,6 +248,7 @@ pub struct HostContext {
     wasi: WasiCtx,
     table: wasmtime::component::ResourceTable,
     client: reqwest::Client,
+    rate_limiter: &'static DiscordRateLimiter,
     gateway_ping_ms: Arc<AtomicU64>,
     application_id: Arc<AtomicU64>,
     shard_senders: Arc<AsyncMutex<Vec<MessageSender>>>,
@@ -226,6 +282,8 @@ impl HostContext {
             wasi: WasiCtxBuilder::new().build(),
             table: wasmtime::component::ResourceTable::default(),
             client: reqwest::Client::new(),
+            rate_limiter: GLOBAL_DISCORD_RATE_LIMITER
+                .get_or_init(|| DiscordRateLimiter::new(DISCORD_RATE_LIMIT_MAX_CONCURRENT)),
             gateway_ping_ms,
             application_id,
             shard_senders,
@@ -239,6 +297,50 @@ impl HostContext {
             limiter: PluginResourceLimiter::new(config.limits),
             config,
         }
+    }
+
+    async fn send_discord_request(
+        &mut self,
+        request: reqwest::Request,
+    ) -> Result<reqwest::Response, String> {
+        let _permit = self.rate_limiter.acquire().await;
+        let mut last_error: Option<String> = None;
+
+        for attempt in 0..=DISCORD_REQUEST_MAX_RETRIES {
+            self.rate_limiter.wait_for_reset().await;
+            let request = request
+                .try_clone()
+                .ok_or_else(|| "request body is not retryable".to_string())?;
+
+            match self.client.execute(request).await {
+                Ok(response) => {
+                    if response.status() == 429 {
+                        let retry_after = response
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(1);
+                        self.rate_limiter.mark_rate_limited(retry_after);
+                        if attempt == DISCORD_REQUEST_MAX_RETRIES {
+                            return Ok(response);
+                        }
+                        last_error = Some(format!("rate limited (retry after {retry_after}s)"));
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    if attempt < DISCORD_REQUEST_MAX_RETRIES {
+                        let delay = Duration::from_millis(200 * 2_u64.pow(attempt));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "discord request failed".to_string()))
     }
 }
 
@@ -268,8 +370,9 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
 
         let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
 
+        let is_discord = is_discord_api_url(&url);
         let mut req_builder = self.client.request(method, &url);
-        if is_discord_api_url(&url) {
+        if is_discord {
             if let Ok(token) = std::env::var("DISCORD_TOKEN") {
                 req_builder = req_builder.header("Authorization", format!("Bot {token}"));
             }
@@ -277,12 +380,17 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
                 req_builder = req_builder.header("Content-Type", "application/json");
             }
         }
+
         let req = req_builder.body(body).build().map_err(|e| e.to_string())?;
 
-        let resp = tokio::time::timeout(HTTP_TIMEOUT, self.client.execute(req))
-            .await
-            .map_err(|_| "http request timed out".to_string())?
-            .map_err(|e| e.to_string())?;
+        let resp = if is_discord {
+            self.send_discord_request(req).await?
+        } else {
+            tokio::time::timeout(HTTP_TIMEOUT, self.client.execute(req))
+                .await
+                .map_err(|_| "http request timed out".to_string())?
+                .map_err(|e| e.to_string())?
+        };
 
         let status = resp.status().as_u16();
         let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
@@ -342,10 +450,21 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
             .build()
             .map_err(|e| e.to_string())?;
 
+        let _permit = self.rate_limiter.acquire().await;
+        self.rate_limiter.wait_for_reset().await;
         let resp = tokio::time::timeout(HTTP_TIMEOUT, self.client.execute(req))
             .await
             .map_err(|_| "http request timed out".to_string())?
             .map_err(|e| e.to_string())?;
+        if resp.status() == 429 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1);
+            self.rate_limiter.mark_rate_limited(retry_after);
+        }
 
         let status = resp.status().as_u16();
         let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
@@ -384,15 +503,15 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
         });
 
         let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
-        let resp = self
+        let req = self
             .client
             .post(&url)
             .header("Authorization", format!("Bot {token}"))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
+            .build()
             .map_err(|e| e.to_string())?;
+        let resp = self.send_discord_request(req).await?;
 
         let status = resp.status().as_u16();
         let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
@@ -439,15 +558,15 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
         let url = format!(
             "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
         );
-        let resp = self
+        let req = self
             .client
             .post(&url)
             .header("Authorization", format!("Bot {token}"))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
+            .build()
             .map_err(|e| e.to_string())?;
+        let resp = self.send_discord_request(req).await?;
 
         if resp.status().is_success() {
             Ok(())
@@ -490,15 +609,15 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
         let url = format!(
             "https://discord.com/api/v10/webhooks/{app_id}/{interaction_token}/messages/@original"
         );
-        let resp = self
+        let req = self
             .client
             .patch(&url)
             .header("Authorization", format!("Bot {token}"))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
+            .build()
             .map_err(|e| e.to_string())?;
+        let resp = self.send_discord_request(req).await?;
 
         if resp.status().is_success() {
             Ok(())
@@ -540,15 +659,15 @@ impl plugin::ynsrvcs::plugins::host::Host for HostContext {
         let url = format!(
             "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
         );
-        let resp = self
+        let req = self
             .client
             .post(&url)
             .header("Authorization", format!("Bot {token}"))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
+            .build()
             .map_err(|e| e.to_string())?;
+        let resp = self.send_discord_request(req).await?;
 
         if resp.status().is_success() {
             Ok(())
@@ -1205,6 +1324,14 @@ impl PluginManager {
             .name
             .clone()
             .unwrap_or_else(|| Self::plugin_name(wasm_path));
+
+        if manifest.plugin.abi_version != 0 && manifest.plugin.abi_version != PLUGIN_ABI_VERSION {
+            anyhow::bail!(
+                "plugin {name} requires ABI version {}, host supports {}",
+                manifest.plugin.abi_version,
+                PLUGIN_ABI_VERSION
+            );
+        }
 
         let component = Component::new(engine, &bytes)?;
         let workspace = workspace_path(&name);
