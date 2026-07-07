@@ -1,89 +1,86 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use fjall::{Database, Keyspace, PersistMode};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-#[derive(Default, Serialize, Deserialize)]
-struct Inner {
-    #[serde(flatten)]
-    scopes: HashMap<String, HashMap<String, Vec<u8>>>,
+pub struct KvStore {
+    database: Arc<Database>,
+    keyspace: Arc<Keyspace>,
 }
 
-#[derive(Clone)]
-pub struct KvStore {
-    path: PathBuf,
-    inner: Arc<Mutex<Inner>>,
+impl Clone for KvStore {
+    fn clone(&self) -> Self {
+        Self {
+            database: Arc::clone(&self.database),
+            keyspace: Arc::clone(&self.keyspace),
+        }
+    }
 }
 
 impl KvStore {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         Self::with_path(kv_path())
     }
 
-    pub fn with_path(path: impl AsRef<Path>) -> Self {
-        Self {
-            path: path.as_ref().to_path_buf(),
-            inner: Arc::new(Mutex::new(Inner::default())),
-        }
-    }
+    pub fn with_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create kv store directory {}", path.display()))?;
 
-    pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let inner = if path.exists() {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("failed to read kv store at {}", path.display()))?;
-            let inner: Inner = serde_json::from_slice(&bytes)
-                .with_context(|| format!("kv store at {} is not valid json", path.display()))?;
-            inner
-        } else {
-            Inner::default()
-        };
+        let database = Database::builder(&path)
+            .open()
+            .with_context(|| format!("failed to open fjall database at {}", path.display()))?;
+        let keyspace = database
+            .keyspace("plugin_kv", fjall::KeyspaceCreateOptions::default)
+            .context("failed to create plugin_kv keyspace")?;
 
         Ok(Self {
-            path: path.to_path_buf(),
-            inner: Arc::new(Mutex::new(inner)),
+            database: Arc::new(database),
+            keyspace: Arc::new(keyspace),
         })
     }
 
-    pub fn get(&self, scope: &str, key: &str) -> Option<Vec<u8>> {
-        let inner = self.inner.lock().ok()?;
-        inner.scopes.get(scope)?.get(key).cloned()
+    pub async fn get(&self, scope: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let composite = composite_key(scope, key);
+        let keyspace = Arc::clone(&self.keyspace);
+
+        let slice = tokio::task::spawn_blocking(move || keyspace.get(composite)).await??;
+
+        Ok(slice.map(|s| s.to_vec()))
     }
 
-    pub fn set(&self, scope: String, key: String, value: Vec<u8>) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.scopes.entry(scope).or_default().insert(key, value);
-        }
+    pub async fn set(&self, scope: String, key: String, value: Vec<u8>) -> Result<()> {
+        let composite = composite_key(&scope, &key);
+        let keyspace = Arc::clone(&self.keyspace);
+
+        tokio::task::spawn_blocking(move || keyspace.insert(composite, value)).await??;
+        Ok(())
     }
 
-    pub fn save(&self) -> Result<()> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("kv store mutex poisoned: {e}"))?;
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create kv store dir {}", parent.display()))?;
-        }
-
-        let bytes = serde_json::to_vec_pretty(&*inner).context("failed to serialize kv store")?;
-        std::fs::write(&self.path, bytes)
-            .with_context(|| format!("failed to write kv store to {}", self.path.display()))?;
-
+    pub async fn save(&self) -> Result<()> {
+        let database = Arc::clone(&self.database);
+        tokio::task::spawn_blocking(move || database.persist(PersistMode::SyncAll)).await??;
         Ok(())
     }
 }
 
 impl Default for KvStore {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("failed to create default kv store")
     }
 }
 
+fn composite_key(scope: &str, key: &str) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(scope.len() + 1 + key.len());
+    buffer.extend_from_slice(scope.as_bytes());
+    buffer.push(0);
+    buffer.extend_from_slice(key.as_bytes());
+    buffer
+}
+
 pub fn kv_path() -> PathBuf {
-    std::env::var("KV_STORE_PATH")
+    std::env::var("DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./kv-store.json"))
+        .unwrap_or_else(|_| PathBuf::from("./data"))
+        .join("plugin-kv")
 }

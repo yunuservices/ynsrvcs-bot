@@ -37,7 +37,7 @@ pub async fn run() -> Result<()> {
     watch_handle.abort();
     let _ = watch_handle.await;
 
-    if let Err(e) = plugin_manager.save_kv() {
+    if let Err(e) = plugin_manager.save_kv().await {
         tracing::error!(?e, "Failed to save KV store");
     }
 
