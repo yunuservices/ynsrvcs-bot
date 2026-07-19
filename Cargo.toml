@@ -23,5 +23,4 @@ semver = "1"
 toml = "0.8"
 fjall = "3.1"
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.7"
+mimalloc = "0.1.52"
